@@ -55,8 +55,17 @@ function Get-Distro {
 
 function Test-Backend {
   if (-not $script:Distro) { return $false }
-  & wsl.exe -d $script:Distro -e bash -lc 'test -x "$HOME/.local/bin/linux-gui"' 2>$null
-  return ($LASTEXITCODE -eq 0)
+  $r = Invoke-WslSync 'test -x "$HOME/.local/bin/linux-gui"'
+  return ($r.Code -eq 0)
+}
+
+function Invoke-WslShutdown {
+  $p = Start-Process -FilePath 'wsl.exe' -ArgumentList '--shutdown' -WindowStyle Hidden -PassThru
+  if (-not $p.WaitForExit(10000)) {
+    try { $p.Kill() } catch { }
+    return $false
+  }
+  return ($p.ExitCode -eq 0)
 }
 
 # 返回当前可见的 WSLg 窗口标题；$Filter 为空表示全部
@@ -75,9 +84,11 @@ function Get-RailWindows {
         $sb = New-Object System.Text.StringBuilder 512
         [WslgRail]::GetWindowText($h, $sb, 512) | Out-Null
         $t = $sb.ToString()
-        if ([string]::IsNullOrEmpty($Filter) -or $t -like "*$Filter*") {
-          [void]$script:railHits.Add($t)
+        $matches = [string]::IsNullOrEmpty($Filter) -or $t -like "*$Filter*"
+        if ($Filter -eq 'XFCE Desktop') {
+          $matches = $matches -or $t -like '*Xephyr*'
         }
+        if ($matches) { [void]$script:railHits.Add($t) }
       }
     }
     return $true
@@ -100,8 +111,29 @@ function New-BackendCmd([string[]]$AppArgs) {
 }
 
 function Invoke-WslSync([string]$Bash) {
-  $out = & wsl.exe -d $script:Distro -e bash -lc $Bash 2>&1 | Out-String
-  return [pscustomobject]@{ Output = $out; Code = $LASTEXITCODE }
+  $job = Start-Job -ScriptBlock {
+    param($d, $b)
+    $o = & wsl.exe -d $d -e bash -lc $b 2>&1 | Out-String
+    [pscustomobject]@{ Output = $o; Code = $LASTEXITCODE }
+  } -ArgumentList $script:Distro, $Bash
+  if (-not (Wait-Job $job -Timeout 30)) {
+    Stop-Job $job -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    return [pscustomobject]@{ Output = '[XX] WSL command timed out after 30 seconds.'; Code = 124 }
+  }
+  $result = Receive-Job $job
+  Remove-Job $job -Force
+  return $result
+}
+
+function New-BackendInstallCmd {
+  $source = Join-Path $PSScriptRoot 'linux-gui'
+  if (-not (Test-Path -LiteralPath $source)) {
+    throw "linux-gui backend not found: $source"
+  }
+  $bytes = [System.IO.File]::ReadAllBytes($source)
+  $encoded = [Convert]::ToBase64String($bytes)
+  return ('mkdir -p "$HOME/.local/bin"; printf ''%s'' ''' + $encoded + ''' | base64 -d > "$HOME/.local/bin/linux-gui"; chmod 755 "$HOME/.local/bin/linux-gui"; "$HOME/.local/bin/linux-gui" --check')
 }
 
 # ---------------------------------------------------------------------------
@@ -114,16 +146,20 @@ function Invoke-CliAction([string[]]$A) {
     Write-Host '[XX] 找不到 WSL 发行版，请先执行: wsl --install' -ForegroundColor Red
     return 1
   }
+  $act = if ($A.Count -gt 0 -and $A[0]) { $A[0].ToLower() } else { '' }
+  $norm = $act.TrimStart('-', '/')
+  if ($norm -eq 'stop-desktop') { $norm = 'stop' }
+  if ($norm -eq 'install') {
+    $r = Invoke-WslSync (New-BackendInstallCmd)
+    Write-Host $r.Output
+    return $r.Code
+  }
   if (-not (Test-Backend)) {
-    Write-Host '[XX] WSL 里找不到 ~/.local/bin/linux-gui' -ForegroundColor Red
+    Write-Host '[XX] WSL 里找不到 ~/.local/bin/linux-gui，请先执行: Linux-GUI.cmd install' -ForegroundColor Red
     return 1
   }
 
-  $act = if ($A.Count -gt 0 -and $A[0]) { $A[0].ToLower() } else { '' }
-
   # 兼容旧写法：--check / -c / restart 等都能用
-  $norm = $act.TrimStart('-', '/')
-  if ($norm -eq 'stop-desktop') { $norm = 'stop' }
   switch ($norm) {
     'desktop' {
       $geom = if ($A.Count -gt 1 -and $A[1]) { $A[1] } else { '1600x900' }
@@ -147,7 +183,7 @@ function Invoke-CliAction([string[]]$A) {
     'fix' { return (Invoke-CliDesktop '1600x900') }
     'restart' {
       Write-Host '正在重启 WSL ...'
-      & wsl.exe --shutdown 2>&1 | Out-Null
+      [void](Invoke-WslShutdown)
       Start-Sleep -Seconds 2
       return (Invoke-CliDesktop '1600x900')
     }
@@ -168,6 +204,7 @@ Linux GUI 启动器 (WSLg) 命令行用法:
   Linux-GUI.cmd desktop [WxH]    启动完整 XFCE 桌面
   Linux-GUI.cmd stop             关闭完整桌面
   Linux-GUI.cmd check            环境自检
+  Linux-GUI.cmd install          安装/更新 WSL 侧后端
   Linux-GUI.cmd fix              重启 WSL 后重开桌面
   Linux-GUI.cmd <命令> [参数]     启动单个程序，例如 thunar / firefox
 '@
@@ -189,7 +226,7 @@ function Invoke-CliDesktop([string]$Geom) {
   }
 
   Write-Host '[!!] 没等到窗口，WSLg 会话可能失效。正在自动重启 WSL 后重试 ...' -ForegroundColor Yellow
-  & wsl.exe --shutdown 2>&1 | Out-Null
+  [void](Invoke-WslShutdown)
   Start-Sleep -Seconds 2
   $r = Invoke-WslSync (New-BackendCmd @('--desktop', $Geom))
   Write-Host $r.Output
@@ -220,6 +257,7 @@ $script:PendingVerify  = $null
 $script:VerifyRetryCmd = $null
 $script:VerifyRetried  = $false
 $script:VerifyTicks    = 0
+$script:JobTicks       = 0
 
 # ---- 控件 ----------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
@@ -273,7 +311,8 @@ function Add-Log([string]$Text) {
 
 function Set-BusyUI([bool]$Busy) {
   foreach ($b in @($script:btnDesktop, $script:btnStop, $script:btnTerm, $script:btnFiles,
-                   $script:btnFirefox, $script:btnCheck, $script:btnFix, $script:btnLogs)) {
+                   $script:btnFirefox, $script:btnCheck, $script:btnFix, $script:btnLogs,
+                   $script:btnInstall)) {
     if ($b) { $b.Enabled = -not $Busy }
   }
   $script:progress.Style = if ($Busy) { 'Marquee' } else { 'Blocks' }
@@ -305,6 +344,7 @@ function Start-WslJob {
   $script:VerifyRetryCmd = if ($RetryBash) { $RetryBash } else { $null }
   $script:VerifyRetried  = $NoAutoRetry
   $script:VerifyTicks    = 0
+  $script:JobTicks       = 0
 
   $script:Job = Start-Job -ScriptBlock {
     param($d, $b)
@@ -326,7 +366,7 @@ function Restart-Desktop {
   Set-BusyUI $true
   Set-Status '正在重启 WSL（修复 WSLg）...' $ColorWarn
   Add-Log '> 重启 WSL 并重新打开桌面'
-  try { & wsl.exe --shutdown 2>&1 | Out-Null } catch { }
+  try { [void](Invoke-WslShutdown) } catch { }
   Start-Sleep -Seconds 2
   Add-Log '  WSL 已停止，正在重新启动桌面 ...'
   $script:Busy = $false
@@ -375,6 +415,14 @@ $script:btnLogs    = New-Button '查看日志' 206 202 130 36 {
        'echo; echo "== xephyr.log =="; tail -n 15 "$lg/xephyr.log" 2>/dev/null'
   Start-WslJob -Label '查看日志' -Bash $b
 }
+$script:btnInstall = New-Button '安装/更新后端' 346 202 130 36 {
+  try {
+    Start-WslJob -Label '安装/更新 WSL 后端' -Bash (New-BackendInstallCmd)
+  } catch {
+    Add-Log "[XX] $($_.Exception.Message)"
+    Set-Status '安装失败：找不到 linux-gui 文件' $ColorErr
+  }
+}
 
 # ---- 状态 / 进度 / 日志 ---------------------------------------------------
 $script:status = New-Object System.Windows.Forms.Label
@@ -410,7 +458,19 @@ $script:PollTimer = New-Object System.Windows.Forms.Timer
 $script:PollTimer.Interval = 250
 $script:PollTimer.Add_Tick({
   if (-not $script:Job) { $script:PollTimer.Stop(); return }
-  if ($script:Job.State -eq 'Running' -or $script:Job.State -eq 'NotStarted') { return }
+  if ($script:Job.State -eq 'Running' -or $script:Job.State -eq 'NotStarted') {
+    $script:JobTicks++
+    if ($script:JobTicks -ge 120) {
+      $script:PollTimer.Stop()
+      Stop-Job $script:Job -ErrorAction SilentlyContinue
+      Remove-Job $script:Job -Force -ErrorAction SilentlyContinue
+      $script:Job = $null
+      Add-Log '[XX] WSL 命令超过 30 秒，已停止。'
+      Set-Status '失败：WSL 命令超时（30 秒）' $ColorErr
+      Done-Busy
+    }
+    return
+  }
 
   $script:PollTimer.Stop()
   $received = Receive-Job $script:Job 2>&1
@@ -462,7 +522,7 @@ $script:VerifyTimer.Add_Tick({
       Add-Log '[!!] 10 秒内没有等到窗口，WSLg 会话很可能已经失效。'
       Add-Log '     自动执行 wsl --shutdown 修复，然后重试 ...'
       Set-Status '正在重启 WSL 修复 ...' $ColorWarn
-      try { & wsl.exe --shutdown 2>&1 | Out-Null } catch { }
+      try { [void](Invoke-WslShutdown) } catch { }
       Start-Sleep -Seconds 2
       Add-Log '     重新启动桌面 ...'
       $script:Job = Start-Job -ScriptBlock {
@@ -470,6 +530,7 @@ $script:VerifyTimer.Add_Tick({
         $o = & wsl.exe -d $d -e bash -lc $b 2>&1 | Out-String
         [pscustomobject]@{ Output = $o; Code = $LASTEXITCODE }
       } -ArgumentList $script:Distro, $script:VerifyRetryCmd
+      $script:JobTicks = 0
       $script:VerifyTicks = 0
       $script:PollTimer.Start()
     } else {

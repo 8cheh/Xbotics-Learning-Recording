@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# linux-gui: WSLg launcher backend.
+set -u
+
+VERSION=1
+BASE_DIR="${XDG_RUNTIME_DIR:-/tmp}/linux-gui-logs"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/linux-gui"
+DISPLAY_NUM="${LINUX_GUI_DISPLAY:-:1}"
+
+mkdir -p "$BASE_DIR" "$STATE_DIR"
+
+say() { printf '%s\n' "$*"; }
+fail() { say "[XX] $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+linux-gui - WSLg launcher backend
+
+Usage:
+  linux-gui --desktop [WIDTHxHEIGHT]
+  linux-gui --stop-desktop
+  linux-gui --check
+  linux-gui --list
+  linux-gui PROGRAM [ARGUMENTS...]
+EOF
+}
+
+valid_geometry() {
+  [[ "${1:-}" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]]
+}
+
+pid_is_running() {
+  [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null
+}
+
+read_pid() {
+  local file="$1"
+  [[ -f "$file" ]] && tr -d '[:space:]' < "$file"
+}
+
+stop_group() {
+  local pid="$1"
+  if pid_is_running "$pid"; then
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      pid_is_running "$pid" || break
+      sleep 1
+    done
+    pid_is_running "$pid" && kill -KILL -- "-$pid" 2>/dev/null || true
+  fi
+}
+
+stop_desktop() {
+  local session xephyr
+  session="$(read_pid "$STATE_DIR/session.pid")"
+  xephyr="$(read_pid "$STATE_DIR/xephyr.pid")"
+  stop_group "$session"
+  stop_group "$xephyr"
+  rm -f "$STATE_DIR/session.pid" "$STATE_DIR/xephyr.pid"
+  say '[OK] XFCE desktop stopped.'
+}
+
+check_dependencies() {
+  local missing=0
+  for command in bash dbus-run-session startxfce4 Xephyr; do
+    if command -v "$command" >/dev/null 2>&1; then
+      say "[OK] $command: $(command -v "$command")"
+    else
+      say "[XX] missing: $command"
+      missing=1
+    fi
+  done
+  if [[ -n "${DISPLAY:-}" ]]; then
+    say "[OK] WSLg DISPLAY: $DISPLAY"
+  else
+    say '[XX] DISPLAY is not set. WSLg is unavailable.'
+    missing=1
+  fi
+  return "$missing"
+}
+
+list_desktop() {
+  local session xephyr
+  session="$(read_pid "$STATE_DIR/session.pid")"
+  xephyr="$(read_pid "$STATE_DIR/xephyr.pid")"
+  if pid_is_running "$session" || pid_is_running "$xephyr"; then
+    say "[OK] desktop running (session=${session:-none}, xephyr=${xephyr:-none}, display=$DISPLAY_NUM)"
+  else
+    say '[--] desktop stopped'
+  fi
+}
+
+start_desktop() {
+  local geometry="${1:-1600x900}"
+  local old_session old_xephyr xephyr_pid session_pid
+  valid_geometry "$geometry" || fail "invalid geometry: $geometry (example: 1600x900)"
+  check_dependencies || fail 'install the missing XFCE/Xephyr packages first'
+
+  old_session="$(read_pid "$STATE_DIR/session.pid")"
+  old_xephyr="$(read_pid "$STATE_DIR/xephyr.pid")"
+  if pid_is_running "$old_session" || pid_is_running "$old_xephyr"; then
+    say '[OK] XFCE desktop is already running.'
+    return 0
+  fi
+
+  : > "$BASE_DIR/xephyr.log"
+  : > "$BASE_DIR/desktop.log"
+  setsid Xephyr "$DISPLAY_NUM" -screen "$geometry" -name 'XFCE Desktop' -ac -br -noreset \
+    >"$BASE_DIR/xephyr.log" 2>&1 &
+  xephyr_pid=$!
+  printf '%s\n' "$xephyr_pid" > "$STATE_DIR/xephyr.pid"
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! pid_is_running "$xephyr_pid"; then
+      fail "Xephyr exited; see $BASE_DIR/xephyr.log"
+    fi
+    if [[ -S "/tmp/.X11-unix/X${DISPLAY_NUM#:}" ]]; then break; fi
+    sleep 1
+  done
+  [[ -S "/tmp/.X11-unix/X${DISPLAY_NUM#:}" ]] || fail "Xephyr did not become ready within 10 seconds"
+
+  setsid env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+    DISPLAY="$DISPLAY_NUM" XDG_SESSION_TYPE=x11 GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb \
+    dbus-run-session -- startxfce4 \
+    >"$BASE_DIR/desktop.log" 2>&1 &
+  session_pid=$!
+  printf '%s\n' "$session_pid" > "$STATE_DIR/session.pid"
+  sleep 1
+  pid_is_running "$session_pid" || fail "XFCE exited; see $BASE_DIR/desktop.log"
+  say "[OK] XFCE desktop started at $geometry."
+}
+
+case "${1:-}" in
+  --desktop)
+    start_desktop "${2:-1600x900}"
+    ;;
+  --stop-desktop)
+    stop_desktop
+    ;;
+  --check)
+    check_dependencies
+    ;;
+  --list)
+    list_desktop
+    ;;
+  --help|-h)
+    usage
+    ;;
+  '')
+    usage
+    exit 2
+    ;;
+  *)
+    command -v "$1" >/dev/null 2>&1 || fail "program not found: $1"
+    "$@" >/dev/null 2>&1 &
+    say "[OK] started: $*"
+    ;;
+esac

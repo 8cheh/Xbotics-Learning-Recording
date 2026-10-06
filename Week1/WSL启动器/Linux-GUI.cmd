@@ -7,6 +7,7 @@ rem  Linux-GUI.cmd desktop [WxH]  -> start the full XFCE desktop directly
 rem  Linux-GUI.cmd stop           -> close the full desktop
 rem  Linux-GUI.cmd check          -> environment diagnostics
 rem  Linux-GUI.cmd fix            -> restart WSL, then start the desktop
+rem  Linux-GUI.cmd install        -> install/update the WSL backend
 rem  Linux-GUI.cmd thunar         -> start a single program
 rem
 rem  NOTE: keep this file ASCII-only. cmd.exe parses .cmd as ANSI and would
